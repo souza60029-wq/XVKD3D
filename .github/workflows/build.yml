@@ -32,7 +32,7 @@ jobs:
            struct vkd3d_instance;
            
           diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-          index 63a82c3..9d1a197 100644
+          index 63a82c3..e60dc26 100644
           --- a/libs/vkd3d/device.c
           +++ b/libs/vkd3d/device.c
           @@ -1255,6 +1255,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
@@ -43,47 +43,95 @@ jobs:
                {"single_queue", VKD3D_CONFIG_FLAG_SINGLE_QUEUE},
                {"descriptor_qa_checks", VKD3D_CONFIG_FLAG_DESCRIPTOR_QA_CHECKS},
                {"no_upload_hvv", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV},
+          @@ -10091,7 +10092,9 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
+           
+               if (fl_override >= D3D_FEATURE_LEVEL_12_2)
+               {
+          -        caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
+          +        /* ESX: do not fake DXR when the user explicitly disabled it with nodxr. */
+          +        if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_NO_DXR))
+          +            caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
+                   caps->options6.VariableShadingRateTier = max(caps->options6.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER_1);
+                   caps->options.ResourceBindingTier = max(caps->options.ResourceBindingTier, D3D12_RESOURCE_BINDING_TIER_3);
+                   caps->options.TiledResourcesTier = max(caps->options.TiledResourcesTier, D3D12_TILED_RESOURCES_TIER_3);
           diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
-          index 353a5d6..e48d6c3 100644
+          index 353a5d6..14bd3b3 100644
           --- a/libs/vkd3d/raytracing_pipeline.c
           +++ b/libs/vkd3d/raytracing_pipeline.c
-          @@ -2662,6 +2662,29 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+          @@ -2621,6 +2621,12 @@ static void d3d12_state_object_collect_variants(struct d3d12_rt_state_object *ob
+               }
+           }
+           
+          +static bool vkd3d_esx_no_rt_libraries(const struct d3d12_device *device)
+          +{
+          +    return (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES) ||
+          +            device->device_info.properties2.properties.vendorID == 0x144d;
+          +}
+          +
+           static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+                   struct d3d12_device *device,
+                   const D3D12_STATE_OBJECT_DESC *desc,
+          @@ -2662,6 +2668,36 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
                        &object->shader_config, &object->pipeline_config)))
                    goto fail;
            
           +    /* ESX: Some drivers (Samsung Xclipse) crash inside vkCreateRayTracingPipelinesKHR when
-          +     * VK_PIPELINE_CREATE_LIBRARY_BIT_KHR is used. Never compile COLLECTIONs to Vulkan pipeline libraries.
-          +     * Instead, keep the parsed DXIL around and compile it into the consuming RTPSO (same mechanism
-          +     * as the existing deferred COLLECTION path), which only uses regular, non-library pipelines. */
-          +    if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
-          +            !(object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) &&
-          +            ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES) ||
-          +             device->device_info.properties2.properties.vendorID == 0x144d))
-          +    {
-          +        INFO("ESX: deferring COLLECTION compilation (no Vulkan RT pipeline libraries).\n");
-          +        d3d12_state_object_cleanup(object);
-          +        object->deferred_data = d3d12_state_object_pipeline_data_defer(&data, object->device);
-          +        if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
-          +            d3d12_state_object_cleanup(object);
-          +        else
-          +            d3d12_device_add_ref(object->device);
-          +        return hr;
-          +    }
+          +     * VK_PIPELINE_CREATE_LIBRARY_BIT_KHR is used. Never create Vulkan RT pipeline libraries:
+          +     * - ALLOW_STATE_OBJECT_ADDITIONS is ignored (it is what makes a plain RTPSO use LIBRARY_BIT);
+          +     *   AddToStateObject() on such objects then fails with E_INVALIDARG.
+          +     * - COLLECTIONs are not compiled up-front. We keep the parsed DXIL around and compile it
+          +     *   into the consuming RTPSO as a regular pipeline (existing deferred COLLECTION path). */
+          +    INFO("ESX: CreateStateObject type=%u flags=%#x subobjects=%u\n",
+          +            (unsigned int)desc->Type, (unsigned int)object->flags, (unsigned int)desc->NumSubobjects);
           +
-          +    if ((object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) &&
-          +            device->device_info.properties2.properties.vendorID == 0x144d)
-          +        WARN("ESX: ALLOW_STATE_OBJECT_ADDITIONS requires RT pipeline libraries, which crash on Xclipse.\n");
+          +    if (vkd3d_esx_no_rt_libraries(device))
+          +    {
+          +        if (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS)
+          +        {
+          +            INFO("ESX: ignoring ALLOW_STATE_OBJECT_ADDITIONS (no Vulkan RT pipeline libraries).\n");
+          +            object->flags &= ~D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+          +        }
+          +
+          +        if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION)
+          +        {
+          +            INFO("ESX: deferring COLLECTION compilation (no Vulkan RT pipeline libraries).\n");
+          +            d3d12_state_object_cleanup(object);
+          +            object->deferred_data = d3d12_state_object_pipeline_data_defer(&data, object->device);
+          +            if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
+          +                d3d12_state_object_cleanup(object);
+          +            else
+          +                d3d12_device_add_ref(object->device);
+          +            return hr;
+          +        }
+          +    }
           +
                /* Figure out how many variants we need. We'll need one pipeline variant
                 * for every unique global root signature. */
                d3d12_state_object_collect_variants(object, &data);
+          diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+          index 0fa8fb1..8e85158 100644
+          --- a/libs/vkd3d/resource.c
+          +++ b/libs/vkd3d/resource.c
+          @@ -3041,8 +3041,10 @@ static HRESULT d3d12_resource_validate_usage(const D3D12_RESOURCE_DESC1 *desc,
+               if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                       (total_flags & required_image_flags) != required_image_flags)
+               {
+          -        WARN("Requested resource flags #%x, but no format in cast list supports it.\n",
+          -                desc->Flags);
+          +        WARN("Requested resource flags #%x, but no format in cast list supports it. "
+          +                "ESX: DXGI format %#x, VkFormat %d, required VK feature flags %#x, available %#x.\n",
+          +                desc->Flags, (unsigned int)desc->Format, format ? (int)format->vk_format : -1,
+          +                (unsigned int)required_image_flags, (unsigned int)total_flags);
+                   return E_INVALIDARG;
+               }
+           
           PATCH_EOF
           cat > profile.json <<'PROFILE_EOF'
           {
             "type": "VKD3D",
-            "versionName": "XVKD3D 0.2 ESX1",
-            "versionCode": 302,
-            "description": "XVKD3D 0.2 ESX1 — VKD3D-Proton 3.0.1 + patch ESX: sem pipeline libraries de RT (driver Xclipse crasha com LIBRARY_BIT).",
+            "versionName": "XVKD3D 0.3",
+            "versionCode": 303,
+            "description": "XVKD3D 0.3 — VKD3D-Proton 3.0.1 + patch ESX2: sem pipeline libraries de RT (driver Xclipse crasha com LIBRARY_BIT).",
             "files": [
               { "source": "system32/d3d12.dll", "target": "${system32}/d3d12.dll" },
               { "source": "system32/d3d12core.dll", "target": "${system32}/d3d12core.dll" },
@@ -110,13 +158,13 @@ jobs:
           cp out/vkd3d-proton-esx/x64/d3d12.dll out/vkd3d-proton-esx/x64/d3d12core.dll wcp/system32/
           cp out/vkd3d-proton-esx/x86/d3d12.dll out/vkd3d-proton-esx/x86/d3d12core.dll wcp/syswow64/
           cp profile.json wcp/
-          tar -C wcp -cJf XVKD3D-0.2-ESX1.wcp .
-          sha256sum XVKD3D-0.2-ESX1.wcp wcp/system32/* wcp/syswow64/* | tee sha256.txt
+          tar -C wcp -cJf XVKD3D-0.3-3.0.1.wcp .
+          sha256sum XVKD3D-0.3-3.0.1.wcp wcp/system32/* wcp/syswow64/* | tee sha256.txt
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: XVKD3D-0.2-ESX1
+          name: XVKD3D-0.3
           path: |
-            XVKD3D-0.2-ESX1.wcp
+            XVKD3D-0.3-3.0.1.wcp
             sha256.txt
