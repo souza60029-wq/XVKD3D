@@ -31,9 +31,9 @@ jobs:
           +/* ESX: force vkDeviceWaitIdle (not just queue) before swapchain destroy on Samsung/Xclipse.
           + * Prevents CMA buffer accumulation that causes OOM at ~91% RAM on Exynos. */
           +#define VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT (1ull << 59)
-
+           
            struct vkd3d_instance;
-
+           
           diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
           index 63a82c3..f4c21a7 100644
           --- a/libs/vkd3d/device.c
@@ -48,7 +48,7 @@ jobs:
                {"descriptor_qa_checks", VKD3D_CONFIG_FLAG_DESCRIPTOR_QA_CHECKS},
                {"no_upload_hvv", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV},
           @@ -10091,7 +10093,9 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
-
+           
                if (fl_override >= D3D_FEATURE_LEVEL_12_2)
                {
           -        caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
@@ -65,7 +65,7 @@ jobs:
           @@ -2621,6 +2621,12 @@ static void d3d12_state_object_collect_variants(struct d3d12_rt_state_object *ob
                }
            }
-
+           
           +static bool vkd3d_esx_no_rt_libraries(const struct d3d12_device *device)
           +{
           +    return (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES) ||
@@ -76,9 +76,10 @@ jobs:
                    struct d3d12_device *device,
                    const D3D12_STATE_OBJECT_DESC *desc,
           @@ -2662,6 +2668,36 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+               if (FAILED(hr = d3d12_state_object_pipeline_data_find_global_state_objects(&data,
                        &object->shader_config, &object->pipeline_config)))
-               goto fail;
-
+                   goto fail;
+          
           +    INFO("ESX: CreateStateObject type=%u flags=%#x subobjects=%u\n",
           +            (unsigned int)desc->Type, (unsigned int)object->flags, (unsigned int)desc->NumSubobjects);
           +
@@ -122,13 +123,13 @@ jobs:
           +                (unsigned int)required_image_flags, (unsigned int)total_flags);
                    return E_INVALIDARG;
                }
-
+           
           diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
           index aaaaaaa..bbbbbbb 100644
           --- a/libs/vkd3d/swapchain.c
           +++ b/libs/vkd3d/swapchain.c
           @@ -1685,11 +1685,29 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk
-
+           
                if (chain->swapchain_maintenance1)
                {
                    dxgi_vk_swap_chain_drain_swapchain_fences(chain);
@@ -175,8 +176,8 @@ jobs:
           }
           PROFILE_EOF
           cd vkd3d-proton
-          git apply --check ../esx.patch
-          git apply ../esx.patch
+          git apply --recount --check ../esx.patch
+          git apply --recount ../esx.patch
           git diff --stat
 
       - name: Build (mingw, x64 + x86)
