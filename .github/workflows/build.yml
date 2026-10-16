@@ -19,32 +19,36 @@ jobs:
           git clone --recursive --branch v3.0.1 https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d-proton
           cat > esx.patch <<'PATCH_EOF'
           diff --git a/include/vkd3d.h b/include/vkd3d.h
-          index bc77c8c..6376768 100644
+          index bc77c8c..8e4f92b 100644
           --- a/include/vkd3d.h
           +++ b/include/vkd3d.h
-          @@ -120,6 +120,8 @@ extern "C" {
+          @@ -120,6 +120,10 @@ extern "C" {
            #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
            #define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
            #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
           +/* ESX: never create VK_PIPELINE_CREATE_LIBRARY_BIT_KHR ray tracing pipelines (Xclipse driver segfaults). */
           +#define VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES (1ull << 63)
-           
+          +/* ESX: force vkDeviceWaitIdle (not just queue) before swapchain destroy on Samsung/Xclipse.
+          + * Prevents CMA buffer accumulation that causes OOM at ~91% RAM on Exynos. */
+          +#define VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT (1ull << 59)
+
            struct vkd3d_instance;
-           
+
           diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-          index 63a82c3..e60dc26 100644
+          index 63a82c3..f4c21a7 100644
           --- a/libs/vkd3d/device.c
           +++ b/libs/vkd3d/device.c
-          @@ -1255,6 +1255,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
+          @@ -1255,6 +1255,8 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
                {"dxr", VKD3D_CONFIG_FLAG_DXR},
                {"dxr12", VKD3D_CONFIG_FLAG_DXR_1_2},
                {"nodxr", VKD3D_CONFIG_FLAG_NO_DXR},
           +    {"esx_no_rt_libraries", VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES},
+          +    {"esx_swapchain_device_wait", VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT},
                {"single_queue", VKD3D_CONFIG_FLAG_SINGLE_QUEUE},
                {"descriptor_qa_checks", VKD3D_CONFIG_FLAG_DESCRIPTOR_QA_CHECKS},
                {"no_upload_hvv", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV},
-          @@ -10091,7 +10092,9 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
-           
+          @@ -10091,7 +10093,9 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
+
                if (fl_override >= D3D_FEATURE_LEVEL_12_2)
                {
           -        caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
@@ -61,7 +65,7 @@ jobs:
           @@ -2621,6 +2621,12 @@ static void d3d12_state_object_collect_variants(struct d3d12_rt_state_object *ob
                }
            }
-           
+
           +static bool vkd3d_esx_no_rt_libraries(const struct d3d12_device *device)
           +{
           +    return (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES) ||
@@ -73,14 +77,8 @@ jobs:
                    const D3D12_STATE_OBJECT_DESC *desc,
           @@ -2662,6 +2668,36 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
                        &object->shader_config, &object->pipeline_config)))
-                   goto fail;
-           
-          +    /* ESX: Some drivers (Samsung Xclipse) crash inside vkCreateRayTracingPipelinesKHR when
-          +     * VK_PIPELINE_CREATE_LIBRARY_BIT_KHR is used. Never create Vulkan RT pipeline libraries:
-          +     * - ALLOW_STATE_OBJECT_ADDITIONS is ignored (it is what makes a plain RTPSO use LIBRARY_BIT);
-          +     *   AddToStateObject() on such objects then fails with E_INVALIDARG.
-          +     * - COLLECTIONs are not compiled up-front. We keep the parsed DXIL around and compile it
-          +     *   into the consuming RTPSO as a regular pipeline (existing deferred COLLECTION path). */
+               goto fail;
+
           +    INFO("ESX: CreateStateObject type=%u flags=%#x subobjects=%u\n",
           +            (unsigned int)desc->Type, (unsigned int)object->flags, (unsigned int)desc->NumSubobjects);
           +
@@ -124,14 +122,49 @@ jobs:
           +                (unsigned int)required_image_flags, (unsigned int)total_flags);
                    return E_INVALIDARG;
                }
-           
+
+          diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+          index aaaaaaa..bbbbbbb 100644
+          --- a/libs/vkd3d/swapchain.c
+          +++ b/libs/vkd3d/swapchain.c
+          @@ -1685,11 +1685,29 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk
+
+               if (chain->swapchain_maintenance1)
+               {
+                   dxgi_vk_swap_chain_drain_swapchain_fences(chain);
+               }
+               else
+               {
+          -        /* Best effort workaround. */
+          +        /* ESX: Samsung Xclipse (vendorID 0x144d) holds CMA-backed EGL buffers in driver-internal
+          +         * contexts beyond the present queue. vkQueueWaitIdle on the present queue alone is not
+          +         * enough — the driver only releases CMA when the full device becomes idle.
+          +         *
+          +         * Without this fix: EGL mtrack grows 48 MB -> 112 MB over ~3 min (observed in dumpsys
+          +         * meminfo for com.ludashi.benchmark), CmaFree drops 25016 kB -> 0, and Android LMKD kills
+          +         * the process at ~91% RAM (~6600 MB on S24 FE / Exynos 2400e). Snapdragon is unaffected
+          +         * because Adreno uses IOMMU+ion heap instead of CMA for swapchain buffers.
+          +         *
+          +         * The device-wait is gated on vendorID 0x144d OR the esx_swapchain_device_wait flag so
+          +         * non-Samsung hardware pays no cost. */
+          +        bool is_samsung = chain->queue->device->device_info.properties2.properties.vendorID == 0x144d;
+          +        if (is_samsung || (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT))
+          +        {
+          +            INFO("ESX: vkDeviceWaitIdle before swapchain destroy (vendorID=%#x)\n",
+          +                    chain->queue->device->device_info.properties2.properties.vendorID);
+          +            VK_CALL(vkDeviceWaitIdle(chain->queue->device->vk_device));
+          +        }
+          +        /* Best effort workaround for non-Samsung: wait on the present queue only. */
+                   vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+                   VK_CALL(vkQueueWaitIdle(vk_queue));
+                   vkd3d_queue_release(chain->queue->vkd3d_queue);
           PATCH_EOF
           cat > profile.json <<'PROFILE_EOF'
           {
             "type": "VKD3D",
-            "versionName": "XVKD3D 0.3",
-            "versionCode": 303,
-            "description": "XVKD3D 0.3 — VKD3D-Proton 3.0.1 + patch ESX2: sem pipeline libraries de RT (driver Xclipse crasha com LIBRARY_BIT).",
+            "versionName": "XVKD3D 0.4",
+            "versionCode": 304,
+            "description": "XVKD3D 0.4 — VKD3D-Proton 3.0.1 + ESX patches: sem RT pipeline libraries (Xclipse crasha) + vkDeviceWaitIdle antes de destruir swapchain (previne acumulo de CMA / OOM a 91% de RAM no Exynos).",
             "files": [
               { "source": "system32/d3d12.dll", "target": "${system32}/d3d12.dll" },
               { "source": "system32/d3d12core.dll", "target": "${system32}/d3d12core.dll" },
@@ -158,13 +191,13 @@ jobs:
           cp out/vkd3d-proton-esx/x64/d3d12.dll out/vkd3d-proton-esx/x64/d3d12core.dll wcp/system32/
           cp out/vkd3d-proton-esx/x86/d3d12.dll out/vkd3d-proton-esx/x86/d3d12core.dll wcp/syswow64/
           cp profile.json wcp/
-          tar -C wcp -cJf XVKD3D-0.3-3.0.1.wcp .
-          sha256sum XVKD3D-0.3-3.0.1.wcp wcp/system32/* wcp/syswow64/* | tee sha256.txt
+          tar -C wcp -cJf XVKD3D-0.4-3.0.1.wcp .
+          sha256sum XVKD3D-0.4-3.0.1.wcp wcp/system32/* wcp/syswow64/* | tee sha256.txt
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: XVKD3D-0.3
+          name: XVKD3D-0.4
           path: |
-            XVKD3D-0.3-3.0.1.wcp
+            XVKD3D-0.4-3.0.1.wcp
             sha256.txt
