@@ -1,204 +1,78 @@
 name: Build XVKD3D (ESX)
+
 on:
   workflow_dispatch:
+    inputs:
+      xvkd3d_version:
+        description: 'XVKD3D version (e.g. 0.5)'
+        required: false
+        default: '0.5'
   push:
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build.yml'
+      - 'wcp-profile.json'
+
+env:
+  UPSTREAM_REPO: https://github.com/HansKristian-Work/vkd3d-proton.git
+  UPSTREAM_TAG: v3.0.1
+  PATCH_FILE: patches/esx-xclipse-v4.patch
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     container: archlinux:base-devel
     steps:
+      - name: Checkout XVKD3D
+        uses: actions/checkout@v4
+
+      - name: Validate patch file exists
+        run: |
+          test -f "$PATCH_FILE" || { echo "Missing $PATCH_FILE"; exit 1; }
+          test -f wcp-profile.json || { echo "Missing wcp-profile.json"; exit 1; }
+
       - name: Install Arch MinGW build dependencies
         run: |
           printf '\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n\n' >> /etc/pacman.conf
           pacman-key --init
           pacman -Sy --needed --noconfirm archlinux-keyring
-          pacman -Syu --needed --noconfirm clang meson glslang git mingw-w64 wine base base-devel sed tar curl wget bash gzip sudo file gawk grep bzip2 which pacman systemd findutils diffutils coreutils procps-ng util-linux xcb-util xcb-util-keysyms xcb-util-wm lib32-libxcb lib32-xcb-util-keysyms
+          pacman -Syu --needed --noconfirm \
+            clang meson glslang git mingw-w64 wine base base-devel \
+            sed tar curl wget bash gzip sudo file gawk grep bzip2 which \
+            findutils diffutils coreutils procps-ng util-linux \
+            xcb-util xcb-util-keysyms xcb-util-wm lib32-libxcb lib32-xcb-util-keysyms
 
-      - name: Clone VKD3D-Proton v3.0.1 and apply ESX patch
+      - name: Clone upstream and apply ESX patch
         run: |
-          git clone --recursive --branch v3.0.1 https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d-proton
-          cat > esx.patch <<'PATCH_EOF'
-          diff --git a/include/vkd3d.h b/include/vkd3d.h
-          index bc77c8c..8e4f92b 100644
-          --- a/include/vkd3d.h
-          +++ b/include/vkd3d.h
-          @@ -120,6 +120,10 @@ extern "C" {
-           #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
-           #define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
-           #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
-          +/* ESX: never create VK_PIPELINE_CREATE_LIBRARY_BIT_KHR ray tracing pipelines (Xclipse driver segfaults). */
-          +#define VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES (1ull << 63)
-          +/* ESX: force vkDeviceWaitIdle (not just queue) before swapchain destroy on Samsung/Xclipse.
-          + * Prevents CMA buffer accumulation that causes OOM at ~91% RAM on Exynos. */
-          +#define VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT (1ull << 59)
-           
-           struct vkd3d_instance;
-           
-          diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-          index 63a82c3..f4c21a7 100644
-          --- a/libs/vkd3d/device.c
-          +++ b/libs/vkd3d/device.c
-          @@ -1255,6 +1255,8 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
-               {"dxr", VKD3D_CONFIG_FLAG_DXR},
-               {"dxr12", VKD3D_CONFIG_FLAG_DXR_1_2},
-               {"nodxr", VKD3D_CONFIG_FLAG_NO_DXR},
-          +    {"esx_no_rt_libraries", VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES},
-          +    {"esx_swapchain_device_wait", VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT},
-               {"single_queue", VKD3D_CONFIG_FLAG_SINGLE_QUEUE},
-               {"descriptor_qa_checks", VKD3D_CONFIG_FLAG_DESCRIPTOR_QA_CHECKS},
-               {"no_upload_hvv", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV},
-          @@ -10091,7 +10093,9 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
-           
-               if (fl_override >= D3D_FEATURE_LEVEL_12_2)
-               {
-          -        caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
-          +        /* ESX: do not fake DXR when the user explicitly disabled it with nodxr. */
-          +        if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_NO_DXR))
-          +            caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
-                   caps->options6.VariableShadingRateTier = max(caps->options6.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER_1);
-                   caps->options.ResourceBindingTier = max(caps->options.ResourceBindingTier, D3D12_RESOURCE_BINDING_TIER_3);
-                   caps->options.TiledResourcesTier = max(caps->options.TiledResourcesTier, D3D12_TILED_RESOURCES_TIER_3);
-          diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
-          index 353a5d6..14bd3b3 100644
-          --- a/libs/vkd3d/raytracing_pipeline.c
-          +++ b/libs/vkd3d/raytracing_pipeline.c
-          @@ -2621,6 +2621,12 @@ static void d3d12_state_object_collect_variants(struct d3d12_rt_state_object *ob
-               }
-           }
-           
-          +static bool vkd3d_esx_no_rt_libraries(const struct d3d12_device *device)
-          +{
-          +    return (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES) ||
-          +            device->device_info.properties2.properties.vendorID == 0x144d;
-          +}
-          +
-           static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
-                   struct d3d12_device *device,
-                   const D3D12_STATE_OBJECT_DESC *desc,
-          @@ -2662,6 +2668,36 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
-               if (FAILED(hr = d3d12_state_object_pipeline_data_find_global_state_objects(&data,
-                       &object->shader_config, &object->pipeline_config)))
-                   goto fail;
-          
-          +    INFO("ESX: CreateStateObject type=%u flags=%#x subobjects=%u\n",
-          +            (unsigned int)desc->Type, (unsigned int)object->flags, (unsigned int)desc->NumSubobjects);
-          +
-          +    if (vkd3d_esx_no_rt_libraries(device))
-          +    {
-          +        if (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS)
-          +        {
-          +            INFO("ESX: ignoring ALLOW_STATE_OBJECT_ADDITIONS (no Vulkan RT pipeline libraries).\n");
-          +            object->flags &= ~D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
-          +        }
-          +
-          +        if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION)
-          +        {
-          +            INFO("ESX: deferring COLLECTION compilation (no Vulkan RT pipeline libraries).\n");
-          +            d3d12_state_object_cleanup(object);
-          +            object->deferred_data = d3d12_state_object_pipeline_data_defer(&data, object->device);
-          +            if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
-          +                d3d12_state_object_cleanup(object);
-          +            else
-          +                d3d12_device_add_ref(object->device);
-          +            return hr;
-          +        }
-          +    }
-          +
-               /* Figure out how many variants we need. We'll need one pipeline variant
-                * for every unique global root signature. */
-               d3d12_state_object_collect_variants(object, &data);
-          diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
-          index 0fa8fb1..8e85158 100644
-          --- a/libs/vkd3d/resource.c
-          +++ b/libs/vkd3d/resource.c
-          @@ -3041,8 +3041,10 @@ static HRESULT d3d12_resource_validate_usage(const D3D12_RESOURCE_DESC1 *desc,
-               if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-                       (total_flags & required_image_flags) != required_image_flags)
-               {
-          -        WARN("Requested resource flags #%x, but no format in cast list supports it.\n",
-          -                desc->Flags);
-          +        WARN("Requested resource flags #%x, but no format in cast list supports it. "
-          +                "ESX: DXGI format %#x, VkFormat %d, required VK feature flags %#x, available %#x.\n",
-          +                desc->Flags, (unsigned int)desc->Format, format ? (int)format->vk_format : -1,
-          +                (unsigned int)required_image_flags, (unsigned int)total_flags);
-                   return E_INVALIDARG;
-               }
-           
-          diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
-          index aaaaaaa..bbbbbbb 100644
-          --- a/libs/vkd3d/swapchain.c
-          +++ b/libs/vkd3d/swapchain.c
-          @@ -1685,11 +1685,29 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk
-           
-               if (chain->swapchain_maintenance1)
-               {
-                   dxgi_vk_swap_chain_drain_swapchain_fences(chain);
-               }
-               else
-               {
-          -        /* Best effort workaround. */
-          +        /* ESX: Samsung Xclipse (vendorID 0x144d) holds CMA-backed EGL buffers in driver-internal
-          +         * contexts beyond the present queue. vkQueueWaitIdle on the present queue alone is not
-          +         * enough — the driver only releases CMA when the full device becomes idle.
-          +         *
-          +         * Without this fix: EGL mtrack grows 48 MB -> 112 MB over ~3 min (observed in dumpsys
-          +         * meminfo for com.ludashi.benchmark), CmaFree drops 25016 kB -> 0, and Android LMKD kills
-          +         * the process at ~91% RAM (~6600 MB on S24 FE / Exynos 2400e). Snapdragon is unaffected
-          +         * because Adreno uses IOMMU+ion heap instead of CMA for swapchain buffers.
-          +         *
-          +         * The device-wait is gated on vendorID 0x144d OR the esx_swapchain_device_wait flag so
-          +         * non-Samsung hardware pays no cost. */
-          +        bool is_samsung = chain->queue->device->device_info.properties2.properties.vendorID == 0x144d;
-          +        if (is_samsung || (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT))
-          +        {
-          +            INFO("ESX: vkDeviceWaitIdle before swapchain destroy (vendorID=%#x)\n",
-          +                    chain->queue->device->device_info.properties2.properties.vendorID);
-          +            VK_CALL(vkDeviceWaitIdle(chain->queue->device->vk_device));
-          +        }
-          +        /* Best effort workaround for non-Samsung: wait on the present queue only. */
-                   vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
-                   VK_CALL(vkQueueWaitIdle(vk_queue));
-                   vkd3d_queue_release(chain->queue->vkd3d_queue);
-          PATCH_EOF
-          cat > profile.json <<'PROFILE_EOF'
-          {
-            "type": "VKD3D",
-            "versionName": "XVKD3D 0.4",
-            "versionCode": 304,
-            "description": "XVKD3D 0.4 — VKD3D-Proton 3.0.1 + ESX patches: sem RT pipeline libraries (Xclipse crasha) + vkDeviceWaitIdle antes de destruir swapchain (previne acumulo de CMA / OOM a 91% de RAM no Exynos).",
-            "files": [
-              { "source": "system32/d3d12.dll", "target": "${system32}/d3d12.dll" },
-              { "source": "system32/d3d12core.dll", "target": "${system32}/d3d12core.dll" },
-              { "source": "syswow64/d3d12.dll", "target": "${syswow64}/d3d12.dll" },
-              { "source": "syswow64/d3d12core.dll", "target": "${syswow64}/d3d12core.dll" }
-            ],
-            "name": "XVKD3D"
-          }
-          PROFILE_EOF
+          git clone --recursive --branch "$UPSTREAM_TAG" "$UPSTREAM_REPO" vkd3d-proton
           cd vkd3d-proton
-          git apply --recount --check ../esx.patch
-          git apply --recount ../esx.patch
+          git apply --check ../"$PATCH_FILE"
+          git apply ../"$PATCH_FILE"
           git diff --stat
 
       - name: Build (mingw, x64 + x86)
         run: |
           cd vkd3d-proton
           ./package-release.sh esx ../out --no-package
+          ls -R ../out | head -40
 
       - name: Package WCP
         run: |
+          XV="${{ inputs.xvkd3d_version || '0.5' }}"
+          test -f "wcp-profile.version" && XV="$(cat wcp-profile.version)"
           ls -R out | head -40
           mkdir -p wcp/system32 wcp/syswow64
           cp out/vkd3d-proton-esx/x64/d3d12.dll out/vkd3d-proton-esx/x64/d3d12core.dll wcp/system32/
           cp out/vkd3d-proton-esx/x86/d3d12.dll out/vkd3d-proton-esx/x86/d3d12core.dll wcp/syswow64/
-          cp profile.json wcp/
-          tar -C wcp -cJf XVKD3D-0.4-3.0.1.wcp .
-          sha256sum XVKD3D-0.4-3.0.1.wcp wcp/system32/* wcp/syswow64/* | tee sha256.txt
+          sed "s/__XVKD3D_VERSION__/$XV/g" wcp-profile.json > wcp/profile.json
+          cat wcp/profile.json
+          tar -C wcp -cJf "XVKD3D-$XV-3.0.1.wcp" .
+          sha256sum "XVKD3D-$XV-3.0.1.wcp" wcp/system32/* wcp/syswow64/* | tee sha256.txt
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: XVKD3D-0.4
+          name: XVKD3D-${{ inputs.xvkd3d_version || '0.5' }}
           path: |
-            XVKD3D-0.4-3.0.1.wcp
+            XVKD3D-*.wcp
             sha256.txt

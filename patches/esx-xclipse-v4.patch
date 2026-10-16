@@ -1,0 +1,145 @@
+diff --git a/include/vkd3d.h b/include/vkd3d.h
+index 0000000..1111111 100644
+--- a/include/vkd3d.h
++++ b/include/vkd3d.h
+@@ -117,6 +117,15 @@ extern "C" {
+ #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
+ #define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
+ #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
+/* XVKD3D/ESX: Samsung Xclipse workarounds. Bit 63 is the only free
+ * bit in v3.0.1 (bits 0-45, 47-62 taken; 46 reserved for upstream).
+ * One flag gates both workarounds; each also auto-activates on
+ * Samsung vendorID 0x144d, so the flag is only needed to force the
+ * behavior on other GPUs for testing. */
+#define VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS (1ull << 63)
+/* Back-compat aliases for esx3.patch users. */
+#define VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS
+#define VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS
+
+ struct vkd3d_instance;
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 0000000..2222222 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1252,6 +1252,9 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
+     {"dxr", VKD3D_CONFIG_FLAG_DXR},
+     {"dxr12", VKD3D_CONFIG_FLAG_DXR_1_2},
+     {"nodxr", VKD3D_CONFIG_FLAG_NO_DXR},
++    {"esx_xclipse_workarounds", VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS},
++    {"esx_no_rt_libraries", VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS},
++    {"esx_swapchain_device_wait", VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS},
+     {"single_queue", VKD3D_CONFIG_FLAG_SINGLE_QUEUE},
+     {"descriptor_qa_checks", VKD3D_CONFIG_FLAG_DESCRIPTOR_QA_CHECKS},
+     {"no_upload_hvv", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV},
+@@ -10088,7 +10091,9 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
+
+     if (fl_override >= D3D_FEATURE_LEVEL_12_2)
+     {
+-        caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
++        /* ESX: do not fake DXR when the user explicitly disabled it with nodxr. */
++        if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_NO_DXR))
++            caps->options5.RaytracingTier = max(caps->options5.RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
+         caps->options6.VariableShadingRateTier = max(caps->options6.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER_1);
+         caps->options.ResourceBindingTier = max(caps->options.ResourceBindingTier, D3D12_RESOURCE_BINDING_TIER_3);
+         caps->options.TiledResourcesTier = max(caps->options.TiledResourcesTier, D3D12_TILED_RESOURCES_TIER_3);
+diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+index 0000000..3333333 100644
+--- a/libs/vkd3d/raytracing_pipeline.c
++++ b/libs/vkd3d/raytracing_pipeline.c
+@@ -2618,6 +2618,13 @@ static void d3d12_state_object_collect_variants(struct d3d12_rt_state_object *ob
+     }
+ }
+
++/* Samsung Xclipse (vendorID 0x144d) segfaults inside
++ * vkCreateRayTracingPipelinesKHR when VK_PIPELINE_CREATE_LIBRARY_BIT_KHR
++ * is used. Never create Vulkan RT pipeline libraries on that GPU. */
++static bool vkd3d_esx_no_rt_libraries(const struct d3d12_device *device)
++{
++    return (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS) ||
++            device->device_info.properties2.properties.vendorID == 0x144d;
++}
++
+ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+         struct d3d12_device *device,
+         const D3D12_STATE_OBJECT_DESC *desc,
+@@ -2659,6 +2666,37 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+         &object->shader_config, &object->pipeline_config)))
+     goto fail;
+
++    /* ESX: Xclipse crashes on RT pipeline libraries. Never create them:
++     * strip ALLOW_STATE_OBJECT_ADDITIONS (makes plain RTPSO use LIBRARY_BIT)
++     * and defer COLLECTION compilation into the consuming RTPSO. */
++    if (vkd3d_esx_no_rt_libraries(device))
++    {
++        if (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS)
++        {
++            INFO("ESX: ignoring ALLOW_STATE_OBJECT_ADDITIONS (no Vulkan RT pipeline libraries).\n");
++            object->flags &= ~D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
++        }
++
++        if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION)
++        {
++            INFO("ESX: deferring COLLECTION compilation (no Vulkan RT pipeline libraries).\n");
++            if (!object->device)
++                object->device = device;
++            d3d12_state_object_cleanup(object);
++            object->deferred_data = d3d12_state_object_pipeline_data_defer(&data, object->device);
++            if (!object->deferred_data)
++            {
++                hr = E_OUTOFMEMORY;
++                goto fail;
++            }
++            if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
++                d3d12_state_object_cleanup(object);
++            else
++                d3d12_device_add_ref(object->device);
++            return hr;
++        }
++    }
++
+     /* Figure out how many variants we need. We'll need one pipeline variant
+      * for every unique global root signature. */
+     d3d12_state_object_collect_variants(object, &data);
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 0000000..4444444 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -3038,8 +3038,10 @@ static HRESULT d3d12_resource_validate_usage(const D3D12_RESOURCE_DESC1 *desc,
+     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+             (total_flags & required_image_flags) != required_image_flags)
+     {
+-        WARN("Requested resource flags #%x, but no format in cast list supports it.\n",
+-                desc->Flags);
++        WARN("Requested resource flags #%x, but no format in cast list supports it. "
++                "ESX: DXGI format %#x, VkFormat %d, required VK feature flags %#x, available %#x.\n",
++                desc->Flags, (unsigned int)desc->Format, format ? (int)format->vk_format : -1,
++                (unsigned int)required_image_flags, (unsigned int)total_flags);
+         return E_INVALIDARG;
+     }
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 0000000..5555555 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1682,6 +1682,26 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk
+     }
+     else
+     {
+-        /* Best effort workaround. */
++        /* ESX: Samsung Xclipse (vendorID 0x144d) holds CMA-backed buffers in
++         * driver-internal contexts beyond the present queue. vkQueueWaitIdle
++         * on the present queue alone is not enough: the driver only releases
++         * CMA when the full device becomes idle. Gated on vendorID 0x144d OR
++         * the esx flag so other GPUs pay no cost. */
++        bool is_samsung = chain->queue->device->device_info.properties2.properties.vendorID == 0x144d;
++        if (is_samsung || (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_XCLIPSE_WORKAROUNDS))
++        {
++            INFO("ESX: vkDeviceWaitIdle before swapchain destroy (vendorID=%#x).\n",
++                    chain->queue->device->device_info.properties2.properties.vendorID);
++            VK_CALL(vkDeviceWaitIdle(chain->queue->device->vk_device));
++        }
++        /* Best effort workaround for non-Samsung: wait on the present queue. */
+         vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+         VK_CALL(vkQueueWaitIdle(vk_queue));
+         vkd3d_queue_release(chain->queue->vkd3d_queue);
