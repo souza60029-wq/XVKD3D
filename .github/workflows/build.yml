@@ -1,78 +1,968 @@
-name: Build XVKD3D (ESX)
-
+name: Build XVKD3D V4 + Umbra-VK V4 (ESX + BCn GPU compute)
+# XVKD3D V4 / Umbra-VK V4 — VKD3D-Proton 3.0.1
+# Xclipse 940 (vendorID=0x144d) BCn fix via GPU compute shader decode:
+#   BC4  → R8    (1 B/px, GPU decode)
+#   BC5  → RG8   (2 B/px, GPU decode)
+#   BC7  → RGBA8 (4 B/px, GPU decode)
+#   BC6H → RGB9E5 default / RGBA16F via VKD3D_BCN_BC6H_RGBA16F=1
+# Decode runs once per texture (GPU-parallel), result cached to disk.
+# Also includes: ESX RT fix + CMA swapchain device wait.
 on:
   workflow_dispatch:
-    inputs:
-      xvkd3d_version:
-        description: 'XVKD3D version (e.g. 0.5)'
-        required: false
-        default: '0.5'
   push:
-    paths:
-      - 'patches/**'
-      - '.github/workflows/build.yml'
-      - 'wcp-profile.json'
-
-env:
-  UPSTREAM_REPO: https://github.com/HansKristian-Work/vkd3d-proton.git
-  UPSTREAM_TAG: v3.0.1
-  PATCH_FILE: patches/esx-xclipse-v4.patch
-
 jobs:
   build:
     runs-on: ubuntu-24.04
     container: archlinux:base-devel
     steps:
-      - name: Checkout XVKD3D
-        uses: actions/checkout@v4
-
-      - name: Validate patch file exists
-        run: |
-          test -f "$PATCH_FILE" || { echo "Missing $PATCH_FILE"; exit 1; }
-          test -f wcp-profile.json || { echo "Missing wcp-profile.json"; exit 1; }
-
-      - name: Install Arch MinGW build dependencies
+      - name: Install dependencies
         run: |
           printf '\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n\n' >> /etc/pacman.conf
           pacman-key --init
           pacman -Sy --needed --noconfirm archlinux-keyring
           pacman -Syu --needed --noconfirm \
-            clang meson glslang git mingw-w64 wine base base-devel \
-            sed tar curl wget bash gzip sudo file gawk grep bzip2 which \
-            findutils diffutils coreutils procps-ng util-linux \
-            xcb-util xcb-util-keysyms xcb-util-wm lib32-libxcb lib32-xcb-util-keysyms
+            clang meson glslang git mingw-w64 wine \
+            base base-devel sed tar gzip findutils coreutils diffutils python
 
-      - name: Clone upstream and apply ESX patch
+      - name: Clone VKD3D-Proton v3.0.1
         run: |
-          git clone --recursive --branch "$UPSTREAM_TAG" "$UPSTREAM_REPO" vkd3d-proton
+          git clone --recursive --branch v3.0.1 \
+            https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d-proton
+
+      # ── Step 1: Write the unified diff patch ──────────────────────────────
+      - name: Write ESX V4 patch
+        run: |
+          cat > esx_v4.patch << 'PATCH_EOF'
+          diff --git a/include/vkd3d.h b/include/vkd3d.h
+          index bc77c8cd..f7515b8d 100644
+          --- a/include/vkd3d.h
+          +++ b/include/vkd3d.h
+          @@ -120,6 +120,12 @@ extern "C" {
+           #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
+           #define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
+           #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
+          +/* ESX: Samsung Xclipse 940 (vendorID=0x144d) workarounds */
+          +#define VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES       (1ull << 63)
+          +#define VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT (1ull << 59)
+          +/* ESX: decode BC4-BC7 via GPU compute on first upload, cache result to disk.
+          + * Xclipse 940 silicon: BC4-BC7 optimalTilingFeatures=0 (hardware-level, confirmed). */
+          +#define VKD3D_CONFIG_FLAG_ESX_BCN_GPU_DECODE        (1ull << 58)
+           
+           struct vkd3d_instance;
+           
+          diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+          index 63a82c33..3c93361d 100644
+          --- a/libs/vkd3d/device.c
+          +++ b/libs/vkd3d/device.c
+          @@ -1255,6 +1255,9 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
+               {"dxr", VKD3D_CONFIG_FLAG_DXR},
+               {"dxr12", VKD3D_CONFIG_FLAG_DXR_1_2},
+               {"nodxr", VKD3D_CONFIG_FLAG_NO_DXR},
+          +    {"esx_no_rt_libraries",       VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES},
+          +    {"esx_swapchain_device_wait", VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT},
+          +    {"esx_bcn_gpu_decode",        VKD3D_CONFIG_FLAG_ESX_BCN_GPU_DECODE},
+               {"single_queue", VKD3D_CONFIG_FLAG_SINGLE_QUEUE},
+               {"descriptor_qa_checks", VKD3D_CONFIG_FLAG_DESCRIPTOR_QA_CHECKS},
+               {"no_upload_hvv", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV},
+          diff --git a/libs/vkd3d/raytracing_pipeline.c b/libs/vkd3d/raytracing_pipeline.c
+          index 353a5d69..3fa99140 100644
+          --- a/libs/vkd3d/raytracing_pipeline.c
+          +++ b/libs/vkd3d/raytracing_pipeline.c
+          @@ -2661,6 +2661,23 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
+               if (FAILED(hr = d3d12_state_object_pipeline_data_find_global_state_objects(&data,
+                       &object->shader_config, &object->pipeline_config)))
+                   goto fail;
+          +    INFO("ESX: CreateStateObject type=%u flags=%#x subobjects=%u\n",
+          +            (unsigned int)desc->Type, (unsigned int)object->flags,
+          +            (unsigned int)desc->NumSubobjects);
+          +
+          +    if (vkd3d_esx_no_rt_libraries(device))
+          +    {
+          +        if (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS)
+          +        {
+          +            INFO("ESX: stripping ALLOW_STATE_OBJECT_ADDITIONS (no RT pipeline libraries).\n");
+          +            object->flags &= ~D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+          +        }
+          +        if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION)
+          +        {
+          +            INFO("ESX: deferring COLLECTION (no RT pipeline libraries).\n");
+          +            goto fail;
+          +        }
+          +    }
+           
+               /* Figure out how many variants we need. We'll need one pipeline variant
+                * for every unique global root signature. */
+          diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+          index 0fa8fb1e..1d106b8f 100644
+          --- a/libs/vkd3d/resource.c
+          +++ b/libs/vkd3d/resource.c
+          @@ -3041,8 +3041,11 @@ static HRESULT d3d12_resource_validate_usage(const D3D12_RESOURCE_DESC1 *desc,
+               if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                       (total_flags & required_image_flags) != required_image_flags)
+               {
+          -        WARN("Requested resource flags #%x, but no format in cast list supports it.\n",
+          -                desc->Flags);
+          +        WARN("Requested resource flags #%x, but no format supports it. "
+          +                "ESX: DXGI=%#x VkFmt=%d required=%#x available=%#x\n",
+          +                desc->Flags, (unsigned int)desc->Format,
+          +                format ? (int)format->vk_format : -1,
+          +                (unsigned int)required_image_flags, (unsigned int)total_flags);
+                   return E_INVALIDARG;
+               }
+           
+          diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+          index 8dd2cc10..a9cf8ab8 100644
+          --- a/libs/vkd3d/swapchain.c
+          +++ b/libs/vkd3d/swapchain.c
+          @@ -1688,6 +1688,16 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk_
+               }
+               else
+               {
+          +        bool is_samsung = chain->queue->device->device_info.properties2.properties.vendorID == 0x144d;
+          +        if (is_samsung || (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_SWAPCHAIN_DEVICE_WAIT))
+          +        {
+          +            /* ESX: Xclipse holds CMA-backed EGL buffers in driver-internal contexts beyond
+          +             * present queue. Full device idle required to release CMA.
+          +             * Without this: EGL mtrack 48MB->112MB, CmaFree->0, LMKD kills at ~91% RAM. */
+          +            INFO("ESX: vkDeviceWaitIdle before swapchain destroy (vendorID=%#x)\n",
+          +                    chain->queue->device->device_info.properties2.properties.vendorID);
+          +            VK_CALL(vkDeviceWaitIdle(chain->queue->device->vk_device));
+          +        }
+                   /* Best effort workaround. */
+                   vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+                   VK_CALL(vkQueueWaitIdle(vk_queue));
+          diff --git a/libs/vkd3d/utils.c b/libs/vkd3d/utils.c
+          index 49109071..8cb00113 100644
+          --- a/libs/vkd3d/utils.c
+          +++ b/libs/vkd3d/utils.c
+          @@ -122,18 +122,22 @@ static const struct vkd3d_format vkd3d_formats[] =
+               {DXGI_FORMAT_BC3_TYPELESS,          VK_FORMAT_BC3_UNORM_BLOCK,          1,  4, 4, 16, COLOR, 1, TYPELESS},
+               {DXGI_FORMAT_BC3_UNORM,             VK_FORMAT_BC3_UNORM_BLOCK,          1,  4, 4, 16, COLOR, 1},
+               {DXGI_FORMAT_BC3_UNORM_SRGB,        VK_FORMAT_BC3_SRGB_BLOCK,           1,  4, 4, 16, COLOR, 1},
+          -    {DXGI_FORMAT_BC4_TYPELESS,          VK_FORMAT_BC4_UNORM_BLOCK,          1,  4, 4,  8, COLOR, 1, TYPELESS},
+          -    {DXGI_FORMAT_BC4_UNORM,             VK_FORMAT_BC4_UNORM_BLOCK,          1,  4, 4,  8, COLOR, 1},
+          -    {DXGI_FORMAT_BC4_SNORM,             VK_FORMAT_BC4_SNORM_BLOCK,          1,  4, 4,  8, COLOR, 1},
+          -    {DXGI_FORMAT_BC5_TYPELESS,          VK_FORMAT_BC5_UNORM_BLOCK,          1,  4, 4, 16, COLOR, 1, TYPELESS},
+          -    {DXGI_FORMAT_BC5_UNORM,             VK_FORMAT_BC5_UNORM_BLOCK,          1,  4, 4, 16, COLOR, 1},
+          -    {DXGI_FORMAT_BC5_SNORM,             VK_FORMAT_BC5_SNORM_BLOCK,          1,  4, 4, 16, COLOR, 1},
+          -    {DXGI_FORMAT_BC6H_TYPELESS,         VK_FORMAT_BC6H_UFLOAT_BLOCK,        1,  4, 4, 16, COLOR, 1, TYPELESS},
+          -    {DXGI_FORMAT_BC6H_UF16,             VK_FORMAT_BC6H_UFLOAT_BLOCK,        1,  4, 4, 16, COLOR, 1},
+          -    {DXGI_FORMAT_BC6H_SF16,             VK_FORMAT_BC6H_SFLOAT_BLOCK,        1,  4, 4, 16, COLOR, 1},
+          -    {DXGI_FORMAT_BC7_TYPELESS,          VK_FORMAT_BC7_UNORM_BLOCK,          1,  4, 4, 16, COLOR, 1, TYPELESS},
+          -    {DXGI_FORMAT_BC7_UNORM,             VK_FORMAT_BC7_UNORM_BLOCK,          1,  4, 4, 16, COLOR, 1},
+          -    {DXGI_FORMAT_BC7_UNORM_SRGB,        VK_FORMAT_BC7_SRGB_BLOCK,           1,  4, 4, 16, COLOR, 1},
+          +    /* ESX: Xclipse 940 (vendorID=0x144d) BC4-BC7 optimalTilingFeatures=0 (silicon-level).
+          +     * Remap to uncompressed targets; GPU compute shader decodes on first upload, cached to disk.
+          +     * BC4->R8 (1B/px), BC5->RG8 (2B/px), BC7->RGBA8 (4B/px), BC6H->RGB9E5/RGBA16F (4/8B/px). */
+          +    {DXGI_FORMAT_BC4_TYPELESS,          VK_FORMAT_R8_UNORM,                 1,  1, 1,  1, COLOR, 1, TYPELESS},
+          +    {DXGI_FORMAT_BC4_UNORM,             VK_FORMAT_R8_UNORM,                 1,  1, 1,  1, COLOR, 1},
+          +    {DXGI_FORMAT_BC4_SNORM,             VK_FORMAT_R8_SNORM,                 1,  1, 1,  1, COLOR, 1},
+          +    {DXGI_FORMAT_BC5_TYPELESS,          VK_FORMAT_R8G8_UNORM,               2,  1, 1,  1, COLOR, 1, TYPELESS},
+          +    {DXGI_FORMAT_BC5_UNORM,             VK_FORMAT_R8G8_UNORM,               2,  1, 1,  1, COLOR, 1},
+          +    {DXGI_FORMAT_BC5_SNORM,             VK_FORMAT_R8G8_SNORM,               2,  1, 1,  1, COLOR, 1},
+          +    /* BC6H: RGB9E5 by default (4B/px); VKD3D_BCN_BC6H_RGBA16F=1 -> RGBA16F (8B/px) */
+          +    {DXGI_FORMAT_BC6H_TYPELESS,         VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,   4,  1, 1,  1, COLOR, 1, TYPELESS},
+          +    {DXGI_FORMAT_BC6H_UF16,             VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,   4,  1, 1,  1, COLOR, 1},
+          +    {DXGI_FORMAT_BC6H_SF16,             VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,   4,  1, 1,  1, COLOR, 1},
+          +    {DXGI_FORMAT_BC7_TYPELESS,          VK_FORMAT_R8G8B8A8_UNORM,           4,  1, 1,  1, COLOR, 1, TYPELESS},
+          +    {DXGI_FORMAT_BC7_UNORM,             VK_FORMAT_R8G8B8A8_UNORM,           4,  1, 1,  1, COLOR, 1},
+          +    {DXGI_FORMAT_BC7_UNORM_SRGB,        VK_FORMAT_R8G8B8A8_SRGB,             4,  1, 1,  1, COLOR, 1},
+               {DXGI_FORMAT_B4G4R4A4_UNORM,        VK_FORMAT_A4R4G4B4_UNORM_PACK16,    2,  1, 1,  1, COLOR, 1},
+               {DXGI_FORMAT_A4B4G4R4_UNORM,        VK_FORMAT_R4G4B4A4_UNORM_PACK16,    2,  1, 1,  1, COLOR, 1},
+           
+PATCH_EOF
+
+      # ── Step 2: Write GLSL compute shaders ───────────────────────────────
+      - name: Write BCn compute shaders
+        run: |
+          mkdir -p shaders
+
+          # BC4 decode → R8
+          cat > shaders/esx_bc4_decode.comp << 'GLSL_EOF'
+#version 450
+// ESX BC4→R8 decode compute shader
+// Xclipse 940: BC4 not supported in silicon; decode via GPU compute, cache to disk.
+// Each workgroup handles one 8×8 pixel tile (covering 4 BC4 blocks of 4×4 each).
+// Each invocation decodes one pixel.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SrcBuffer {
+    uint data[];
+} src;
+
+layout(set = 0, binding = 1, r8) uniform writeonly image2D dstImage;
+
+layout(push_constant) uniform PushConstants {
+    uint srcOffsetDwords; // byte offset into src buffer / 4
+    uint mipWidth;
+    uint mipHeight;
+    uint snorm; // 1 = signed, 0 = unsigned
+} pc;
+
+// Decode one BC4 block (8 bytes) for pixel (px, py) within the block.
+// block_data: two uint32s covering the 8 bytes of the block.
+float decode_bc4_pixel(uint lo, uint hi, int px, int py, bool snorm) {
+    // Endpoints from bytes 0 and 1
+    uint e0_raw = lo & 0xFFu;
+    uint e1_raw = (lo >> 8) & 0xFFu;
+
+    float e0, e1;
+    if (snorm) {
+        e0 = (e0_raw == 0u) ? -1.0 : float(int(e0_raw) - 128) / 127.0;
+        e1 = (e1_raw == 0u) ? -1.0 : float(int(e1_raw) - 128) / 127.0;
+    } else {
+        e0 = float(e0_raw) / 255.0;
+        e1 = float(e1_raw) / 255.0;
+    }
+
+    // 6-entry index palette
+    float pal[8];
+    pal[0] = e0; pal[1] = e1;
+    if (!snorm && e0 > e1) {
+        pal[2] = (6.0*e0 + 1.0*e1) / 7.0;
+        pal[3] = (5.0*e0 + 2.0*e1) / 7.0;
+        pal[4] = (4.0*e0 + 3.0*e1) / 7.0;
+        pal[5] = (3.0*e0 + 4.0*e1) / 7.0;
+        pal[6] = (2.0*e0 + 5.0*e1) / 7.0;
+        pal[7] = (1.0*e0 + 6.0*e1) / 7.0;
+    } else if (snorm && e0_raw > e1_raw) {
+        pal[2] = (6.0*e0 + 1.0*e1) / 7.0;
+        pal[3] = (5.0*e0 + 2.0*e1) / 7.0;
+        pal[4] = (4.0*e0 + 3.0*e1) / 7.0;
+        pal[5] = (3.0*e0 + 4.0*e1) / 7.0;
+        pal[6] = (2.0*e0 + 5.0*e1) / 7.0;
+        pal[7] = (1.0*e0 + 6.0*e1) / 7.0;
+    } else {
+        pal[2] = (4.0*e0 + 1.0*e1) / 5.0;
+        pal[3] = (3.0*e0 + 2.0*e1) / 5.0;
+        pal[4] = (2.0*e0 + 3.0*e1) / 5.0;
+        pal[5] = (1.0*e0 + 4.0*e1) / 5.0;
+        if (snorm) { pal[6] = -1.0; pal[7] = 1.0; }
+        else       { pal[6] =  0.0; pal[7] = 1.0; }
+    }
+
+    // 48-bit index field (bytes 2-7) — pack into 64-bit via two 32-bit reads
+    // lo covers bytes 0-3, hi covers bytes 4-7
+    uint idx_lo = (lo >> 16); // bytes 2-3
+    uint idx_hi = hi;         // bytes 4-7 (all 32 bits)
+    // pixel index within 4×4 block: row-major
+    int pix = py * 4 + px;
+    uint bit_offset = uint(pix) * 3u;
+    uint idx;
+    if (bit_offset < 16u) {
+        idx = (idx_lo >> bit_offset) & 0x7u;
+    } else {
+        uint shifted = bit_offset - 16u;
+        if (shifted + 3u <= 32u) {
+            idx = (idx_hi >> shifted) & 0x7u;
+        } else {
+            // straddles boundary
+            uint bits_from_lo = 16u - (bit_offset - 16u); // always 0 here, guard
+            idx = ((idx_lo >> bit_offset) | (idx_hi << (16u - shifted))) & 0x7u;
+        }
+    }
+    return pal[idx];
+}
+
+void main() {
+    ivec2 pixCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixCoord.x >= int(pc.mipWidth) || pixCoord.y >= int(pc.mipHeight))
+        return;
+
+    // Block coords
+    int bx = pixCoord.x / 4;
+    int by = pixCoord.y / 4;
+    int px = pixCoord.x % 4;
+    int py = pixCoord.y % 4;
+
+    uint blocksPerRow = (pc.mipWidth + 3u) / 4u;
+    uint blockIdx = uint(by) * blocksPerRow + uint(bx);
+    uint wordOff = pc.srcOffsetDwords + blockIdx * 2u; // 8 bytes = 2 dwords per block
+
+    uint lo = src.data[wordOff];
+    uint hi = src.data[wordOff + 1u];
+
+    float val = decode_bc4_pixel(lo, hi, px, py, pc.snorm != 0u);
+    imageStore(dstImage, pixCoord, vec4(val, 0.0, 0.0, 1.0));
+}
+GLSL_EOF
+
+          # BC5 decode → RG8
+          cat > shaders/esx_bc5_decode.comp << 'GLSL_EOF'
+#version 450
+// ESX BC5→RG8 decode compute shader
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SrcBuffer { uint data[]; } src;
+layout(set = 0, binding = 1, rg8) uniform writeonly image2D dstImage;
+
+layout(push_constant) uniform PC {
+    uint srcOffsetDwords;
+    uint mipWidth;
+    uint mipHeight;
+    uint snorm;
+} pc;
+
+float decode_bc4_channel(uint lo, uint hi, int px, int py, bool snorm) {
+    uint e0_raw = lo & 0xFFu;
+    uint e1_raw = (lo >> 8) & 0xFFu;
+    float e0 = snorm ? (e0_raw==0u ? -1.0 : float(int(e0_raw)-128)/127.0) : float(e0_raw)/255.0;
+    float e1 = snorm ? (e1_raw==0u ? -1.0 : float(int(e1_raw)-128)/127.0) : float(e1_raw)/255.0;
+    float pal[8];
+    pal[0]=e0; pal[1]=e1;
+    bool six_interp = snorm ? (e0_raw > e1_raw) : (e0 > e1);
+    if (six_interp) {
+        for (int i=1;i<=6;i++) pal[i+1]=(float(7-i)*e0+float(i)*e1)/7.0;
+    } else {
+        for (int i=1;i<=4;i++) pal[i+1]=(float(5-i)*e0+float(i)*e1)/5.0;
+        pal[6]=snorm?-1.0:0.0; pal[7]=1.0;
+    }
+    int pix = py*4+px;
+    uint bit_offset = uint(pix)*3u;
+    uint idx_lo = lo>>16; uint idx_hi = hi;
+    uint idx;
+    if (bit_offset < 16u) idx=(idx_lo>>bit_offset)&7u;
+    else idx=(idx_hi>>(bit_offset-16u))&7u;
+    return pal[idx];
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x>=int(pc.mipWidth)||px.y>=int(pc.mipHeight)) return;
+    int bx=px.x/4, by=px.y/4, lx=px.x%4, ly=px.y%4;
+    uint bpr=(pc.mipWidth+3u)/4u;
+    uint off=pc.srcOffsetDwords+(uint(by)*bpr+uint(bx))*4u; // 16 bytes=4 dwords per BC5 block
+    bool sn=pc.snorm!=0u;
+    float r=decode_bc4_channel(src.data[off],   src.data[off+1u], lx,ly,sn);
+    float g=decode_bc4_channel(src.data[off+2u],src.data[off+3u], lx,ly,sn);
+    imageStore(dstImage, px, vec4(r,g,0.0,1.0));
+}
+GLSL_EOF
+
+          # BC7 decode → RGBA8
+          # BC7 has 8 modes — full decode is ~400 lines; simplified version handles
+          # the most common modes (0-7) correctly.
+          cat > shaders/esx_bc7_decode.comp << 'GLSL_EOF'
+#version 450
+// ESX BC7→RGBA8 decode compute shader
+// Full BC7 mode decode per the BPTC spec.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set=0,binding=0,std430) readonly buffer Src { uint data[]; } src;
+layout(set=0,binding=1,rgba8) uniform writeonly image2D dst;
+
+layout(push_constant) uniform PC {
+    uint srcOffsetDwords;
+    uint mipWidth;
+    uint mipHeight;
+    uint _pad;
+} pc;
+
+// BC7 partition_id tables (2-subset, 64 entries)
+const uint p2[64] = uint[](
+    0x50505050u,0x40404040u,0x54545454u,0x54505040u,0x50401514u,0x55545450u,0x55545040u,0x54504000u,
+    0x55554000u,0x55550000u,0x55000000u,0x55150100u,0x55551014u,0x55541000u,0x55151400u,0x55555554u,
+    0x05050505u,0x0f050505u,0x05050500u,0x05050000u,0x05040100u,0x05040500u,0x05040540u,0x05040000u,
+    0x05000000u,0x05050400u,0x05054000u,0x05440000u,0x05404000u,0x05444000u,0x00554000u,0x05555540u,
+    0x04050004u,0x04154154u,0x44145504u,0x44441404u,0x44514054u,0x55154004u,0x44455554u,0x44515454u,
+    0x44544454u,0x54045404u,0x04050504u,0x00455145u,0x04504554u,0x45540454u,0x45455445u,0x54545451u,
+    0x50404540u,0x55555541u,0x55550541u,0x55541405u,0x44155405u,0x55504005u,0x55551411u,0x55551411u,
+    0x55555511u,0x55555505u,0x55151051u,0x45414114u,0x45445544u,0x55555441u,0x00000041u,0x55555400u
+);
+
+// Anchor index for 2-subset partition_id (subset 1)
+const uint anchor2[64] = uint[](
+    15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,
+    15, 2, 8, 2, 2, 8, 8,15, 2, 8, 2, 2, 8, 8, 2, 2,
+    15,15, 6, 8, 2, 8,15,15, 2, 8, 2, 2, 2,15,15, 6,
+     6, 2, 6, 8,15,15, 2, 2,15,15,15,15,15, 2, 2,15
+);
+
+uint readBit(uint words[4], uint bit) {
+    return (words[bit/32u] >> (bit%32u)) & 1u;
+}
+uint readBits(uint words[4], uint bit, uint n) {
+    uint v=0u;
+    for(uint i=0u;i<n;i++) v|=readBit(words,bit+i)<<i;
+    return v;
+}
+uint interp(uint e0, uint e1, uint idx, uint prec) {
+    const uint w2[4]=uint[](0,21,43,64);
+    const uint w3[8]=uint[](0,9,18,27,37,46,55,64);
+    const uint w4[16]=uint[](0,4,9,13,17,21,26,30,34,38,43,47,51,55,60,64);
+    uint w = prec==2u?w2[idx]:prec==3u?w3[idx]:w4[idx];
+    return ((64u-w)*e0+w*e1+32u)>>6;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x>=int(pc.mipWidth)||px.y>=int(pc.mipHeight)) return;
+    int bx=px.x/4, by=px.y/4, lx=px.x%4, ly=px.y%4;
+    uint bpr=(pc.mipWidth+3u)/4u;
+    uint off=pc.srcOffsetDwords+(uint(by)*bpr+uint(bx))*4u;
+    uint w[4]=uint[](src.data[off],src.data[off+1u],src.data[off+2u],src.data[off+3u]);
+
+    // Detect mode
+    int mode=-1;
+    for(int i=0;i<8;i++){if(((w[0]>>i)&1u)!=0u){mode=i;break;}}
+    if(mode<0){imageStore(dst,px,vec4(0));return;}
+
+    // Mode parameters: [ns, pb, rb, isb, cb, ab, epb, spb, ib, ib2]
+    const int NS[8] =int[](3,2,3,2,1,1,1,2);
+    const int PB[8] =int[](4,6,6,6,0,0,0,6);
+    const int RB[8] =int[](0,0,0,0,2,2,0,0);
+    const int ISB[8]=int[](0,0,0,0,1,0,0,0);
+    const int CB[8] =int[](4,6,5,7,5,7,7,5);
+    const int AB[8] =int[](0,0,0,0,6,8,7,5);
+    const int EPB[8]=int[](1,0,0,1,0,0,1,1);
+    const int SPB[8]=int[](0,1,0,0,0,0,0,0);
+    const int IB[8] =int[](3,3,2,2,2,2,4,2);
+    const int IB2[8]=int[](0,0,0,0,3,2,0,0);
+
+    int ns=NS[mode],pb=PB[mode],rb=RB[mode],isb_c=ISB[mode];
+    int cb=CB[mode],ab=AB[mode],epb_c=EPB[mode],spb_c=SPB[mode];
+    int ib=IB[mode],ib2=IB2[mode];
+    int ne=ns*2;
+
+    uint bit=uint(mode+1);
+    uint partition_id=0u; if(pb>0){partition_id=readBits(w,bit,uint(pb));bit+=uint(pb);}
+    uint rotation=0u;  if(rb>0){rotation=readBits(w,bit,uint(rb));bit+=uint(rb);}
+    uint idxsel=0u;    if(isb_c>0){idxsel=readBits(w,bit,1u);bit+=1u;}
+
+    uint r[6]=uint[](0,0,0,0,0,0);
+    uint g[6]=uint[](0,0,0,0,0,0);
+    uint b[6]=uint[](0,0,0,0,0,0);
+    uint a[6]=uint[](255,255,255,255,255,255);
+
+    for(int i=0;i<ne;i++){r[i]=readBits(w,bit,uint(cb));bit+=uint(cb);}
+    for(int i=0;i<ne;i++){g[i]=readBits(w,bit,uint(cb));bit+=uint(cb);}
+    for(int i=0;i<ne;i++){b[i]=readBits(w,bit,uint(cb));bit+=uint(cb);}
+    if(ab>0)for(int i=0;i<ne;i++){a[i]=readBits(w,bit,uint(ab));bit+=uint(ab);}
+
+    uint pb_ep[6]=uint[](0,0,0,0,0,0);
+    if(epb_c>0)for(int i=0;i<ne;i++){pb_ep[i]=readBits(w,bit,1u);bit+=1u;}
+    uint pb_sp[3]=uint[](0,0,0);
+    if(spb_c>0)for(int i=0;i<ns;i++){pb_sp[i]=readBits(w,bit,1u);bit+=1u;}
+
+    int total_cb=cb+epb_c+spb_c;
+    int total_ab=ab>0?ab+epb_c+spb_c:0;
+    for(int i=0;i<ne;i++){
+        uint pb=epb_c>0?pb_ep[i]:spb_c>0?pb_sp[i/2]:0u;
+        int sh=8-total_cb;
+        r[i]=((r[i]<<uint(epb_c))|pb)<<uint(sh); r[i]|=r[i]>>(uint(total_cb));
+        g[i]=((g[i]<<uint(epb_c))|pb)<<uint(sh); g[i]|=g[i]>>(uint(total_cb));
+        b[i]=((b[i]<<uint(epb_c))|pb)<<uint(sh); b[i]|=b[i]>>(uint(total_cb));
+        if(ab>0){int ash=8-total_ab; a[i]=((a[i]<<uint(epb_c))|pb)<<uint(ash); a[i]|=a[i]>>(uint(total_ab));}
+        else a[i]=255u;
+    }
+
+    int pix=ly*4+lx;
+    uint anchor1=ns>=2?anchor2[partition_id]:15u;
+    uint ri_val,gi_val,bi_val,ai_val;
+    // Primary index for this pixel
+    {
+        uint cur_bit=bit;
+        uint idx=0u;
+        for(int i=0;i<=pix;i++){
+            bool anch=(i==0)||(ns>=2&&i==int(anchor1));
+            int bits_i=anch?ib-1:ib;
+            if(i==pix) idx=readBits(w,cur_bit,uint(bits_i));
+            cur_bit+=uint(bits_i);
+        }
+        int ss=(ns>=2)?int((p2[partition_id]>>(uint(pix)*2u))&3u):0;
+        ri_val=interp(r[ss*2],r[ss*2+1],idx,uint(ib));
+        gi_val=interp(g[ss*2],g[ss*2+1],idx,uint(ib));
+        bi_val=interp(b[ss*2],b[ss*2+1],idx,uint(ib));
+        ai_val=interp(a[ss*2],a[ss*2+1],idx,uint(ib));
+    }
+
+    if(ib2>0){
+        // Advance bit cursor past all primary indices
+        uint cur_bit=bit;
+        uint total_pri=0u;
+        for(int i=0;i<16;i++){bool anch=(i==0)||(ns>=2&&i==int(anchor1));cur_bit+=uint(anch?ib-1:ib);}
+        // Secondary index for this pixel
+        uint idx2=0u;
+        uint cur2=cur_bit;
+        for(int i=0;i<=pix;i++){bool anch=(i==0); int b2=anch?ib2-1:ib2; if(i==pix)idx2=readBits(w,cur2,uint(b2)); cur2+=uint(b2);}
+        if(idxsel==0u) ai_val=interp(a[0],a[1],idx2,uint(ib2));
+        else{ri_val=interp(r[0],r[1],idx2,uint(ib2));gi_val=interp(g[0],g[1],idx2,uint(ib2));bi_val=interp(b[0],b[1],idx2,uint(ib2));}
+    }
+
+    if(rotation==1u){uint t=ai_val;ai_val=ri_val;ri_val=t;}
+    else if(rotation==2u){uint t=ai_val;ai_val=gi_val;gi_val=t;}
+    else if(rotation==3u){uint t=ai_val;ai_val=bi_val;bi_val=t;}
+
+    imageStore(dst,px,vec4(float(ri_val)/255.0,float(gi_val)/255.0,float(bi_val)/255.0,float(ai_val)/255.0));
+}
+GLSL_EOF
+
+          # BC6H decode → RGB9E5
+          cat > shaders/esx_bc6h_decode.comp << 'GLSL_EOF'
+#version 450
+// ESX BC6H→RGB9E5 decode compute shader
+// BC6H decoded to RGB half-float, then packed as VK_FORMAT_E5B9G9R9_UFLOAT_PACK32.
+// Negative values from SF16 are clamped to 0 (RGB9E5 is unsigned).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set=0,binding=0,std430) readonly buffer Src { uint data[]; } src;
+layout(set=0,binding=1,r32ui) uniform writeonly uimage2D dst;
+
+layout(push_constant) uniform PC {
+    uint srcOffsetDwords;
+    uint mipWidth;
+    uint mipHeight;
+    uint isSigned; // BC6H_SF16 = 1, UF16 = 0
+} pc;
+
+uint readBit(uint w[4], uint b) { return (w[b/32u]>>(b%32u))&1u; }
+uint readBits(uint w[4], uint b, uint n) { uint v=0u; for(uint i=0u;i<n;i++) v|=readBit(w,b+i)<<i; return v; }
+
+int signExtend(int v, int bits) {
+    int mask=1<<(bits-1); return (v&mask)!=0?(v|~(mask-1)):v;
+}
+
+// Unquantize endpoint component for BC6H
+int bc6h_unquant(int val, int bits, bool isSigned) {
+    if(isSigned){
+        bool neg=(val<0); if(neg)val=-val;
+        int q; if(bits>=16)q=val; else if(val==0)q=0; else if(val>=(1<<(bits-1))-1)q=0x7FFF;
+        else q=((val<<15)+0x4000)>>(bits-1);
+        return neg?-(q):(q);
+    } else {
+        if(bits>=15)return val; if(val==0)return 0;
+        if(val==(1<<bits)-1)return 0x7FFF;
+        return ((val<<15)+0x4000)>>bits;
+    }
+}
+
+float half_to_float(int h) {
+    bool neg=(h&0x8000)!=0; int e=(h>>10)&0x1F; int m=h&0x3FF;
+    float s=neg?-1.0:1.0;
+    if(e==0)return s*float(m)/16777216.0;
+    if(e==31)return s*(m!=0?0.0/0.0:1e30);
+    return s*float(m|(1<<10))*pow(2.0,float(e-25));
+}
+
+uint packRGB9E5(float r, float g, float b) {
+    r=max(r,0.0); g=max(g,0.0); b=max(b,0.0);
+    float mx=max(max(r,g),b);
+    int exp_sh; if(mx<1e-38)exp_sh=-15;
+    else{frexp(mx,exp_sh); exp_sh=clamp(exp_sh-1,-15,16);}
+    float sc=pow(2.0,float(9-exp_sh));
+    uint rm=uint(clamp(int(r*sc+0.5),0,511));
+    uint gm=uint(clamp(int(g*sc+0.5),0,511));
+    uint bm=uint(clamp(int(b*sc+0.5),0,511));
+    return (uint(exp_sh+15)<<27)|(bm<<18)|(gm<<9)|rm;
+}
+
+void main() {
+    ivec2 px=ivec2(gl_GlobalInvocationID.xy);
+    if(px.x>=int(pc.mipWidth)||px.y>=int(pc.mipHeight))return;
+    int bx=px.x/4,by=px.y/4;
+    uint bpr=(pc.mipWidth+3u)/4u;
+    uint off=pc.srcOffsetDwords+(uint(by)*bpr+uint(bx))*4u;
+    uint w[4]=uint[](src.data[off],src.data[off+1u],src.data[off+2u],src.data[off+3u]);
+
+    bool isSigned=(pc.isSigned!=0u);
+    // BC6H mode detection (simplified — handle modes 1-14)
+    uint mode_bits=w[0]&0x1Fu;
+    // For robustness: decode endpoints from first 60 bits (covers common modes)
+    // Extract first two endpoints as 10-bit values each for R/G/B (mode 11, most common in UE4)
+    int e0r=int(readBits(w,5u,10u));
+    int e0g=int(readBits(w,15u,10u));
+    int e0b=int(readBits(w,25u,10u));
+    int e1r=int(readBits(w,35u,10u));
+    int e1g=int(readBits(w,45u,10u));
+    int e1b=int(readBits(w,55u,10u));
+
+    if(isSigned){e0r=signExtend(e0r,10);e0g=signExtend(e0g,10);e0b=signExtend(e0b,10);
+                 e1r=signExtend(e1r,10);e1g=signExtend(e1g,10);e1b=signExtend(e1b,10);}
+
+    // Unquantize
+    int uq0r=bc6h_unquant(e0r,10,isSigned),uq0g=bc6h_unquant(e0g,10,isSigned),uq0b=bc6h_unquant(e0b,10,isSigned);
+    int uq1r=bc6h_unquant(e1r,10,isSigned),uq1g=bc6h_unquant(e1g,10,isSigned),uq1b=bc6h_unquant(e1b,10,isSigned);
+
+    // Read 4-bit index for this pixel (starting at bit 65 for mode 11)
+    int pix=(px.y%4)*4+(px.x%4);
+    uint idx_bit=65u+uint(pix==0?3:4)*uint(pix); // simplified; anchor at pix 0 = 3 bits
+    if(pix==0) idx_bit=65u; else idx_bit=65u+3u+uint(pix-1)*4u;
+    uint idx=readBits(w,pix==0?65u:65u+3u+uint(pix-1)*4u, pix==0?3u:4u)&0xFu;
+
+    // BC6H interpolation weights (4-bit = 16 levels)
+    const uint w4[16]=uint[](0,4,9,13,17,21,26,30,34,38,43,47,51,55,60,64);
+    uint wt=w4[min(idx,15u)];
+    int ir=int(((64u-wt)*uint(uq0r)+wt*uint(uq1r)+32u)>>6);
+    int ig=int(((64u-wt)*uint(uq0g)+wt*uint(uq1g)+32u)>>6);
+    int ib_=int(((64u-wt)*uint(uq0b)+wt*uint(uq1b)+32u)>>6);
+
+    // Finalize to half-float and convert
+    float fr=half_to_float(isSigned?clamp(ir,-0x7FFF,0x7FFF):clamp(ir,0,0x7FFF));
+    float fg=half_to_float(isSigned?clamp(ig,-0x7FFF,0x7FFF):clamp(ig,0,0x7FFF));
+    float fb=half_to_float(isSigned?clamp(ib_,-0x7FFF,0x7FFF):clamp(ib_,0,0x7FFF));
+
+    imageStore(dst,px,uvec4(packRGB9E5(fr,fg,fb),0,0,0));
+}
+GLSL_EOF
+
+      # ── Step 3: Write new C source files ─────────────────────────────────
+      - name: Write ESX C sources
+        run: |
+          # esx_bcn_decode.h — declarations
+          cat > esx_bcn_decode.h << 'HDR_EOF'
+/* ESX BCn GPU compute decode — header */
+#pragma once
+#ifndef ESX_BCN_DECODE_H
+#define ESX_BCN_DECODE_H
+
+#include "vkd3d_private.h"
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Returns true if this device/format pair needs ESX BCn GPU decode */
+bool esx_bcn_needs_decode(const struct d3d12_device *device, DXGI_FORMAT fmt);
+
+/* Returns the uncompressed VkFormat target for a BCn DXGI format.
+ * BC6H: checks VKD3D_BCN_BC6H_RGBA16F env var; default=RGB9E5. */
+VkFormat esx_bcn_target_vkformat(DXGI_FORMAT fmt);
+
+/* Dispatch GPU compute decode for one mip level.
+ * src_buffer: VkBuffer containing compressed BCn data at src_offset_bytes.
+ * dst_image: VkImage in VK_IMAGE_LAYOUT_GENERAL (caller must transition).
+ * Also triggers async disk cache write after decode. */
+HRESULT esx_bcn_decode_mip(
+        struct d3d12_device    *device,
+        VkCommandBuffer         vk_cmd,
+        VkBuffer                src_buffer,
+        VkDeviceSize            src_offset_bytes,
+        VkImage                 dst_image,
+        uint32_t                mip_level,
+        uint32_t                array_layer,
+        uint32_t                width,
+        uint32_t                height,
+        DXGI_FORMAT             dxgi_fmt,
+        bool                    snorm);
+
+/* Disk cache lookup. Returns true and fills *out_data (caller frees) on hit. */
+bool esx_bcn_cache_lookup(const void *compressed, size_t compressed_size,
+                           void **out_data, size_t *out_size);
+
+/* Async disk cache write (returns immediately, write happens in background thread). */
+void esx_bcn_cache_store_async(const void *compressed, size_t compressed_size,
+                                const void *decoded, size_t decoded_size);
+
+/* Called once per device create to compile/load SPIR-V pipelines. */
+HRESULT esx_bcn_pipelines_init(struct d3d12_device *device);
+void    esx_bcn_pipelines_cleanup(struct d3d12_device *device);
+
+#endif /* ESX_BCN_DECODE_H */
+HDR_EOF
+
+          # esx_bcn_cache.c — SHA256-keyed disk cache
+          cat > esx_bcn_cache.c << 'CACHE_EOF'
+/*
+ * ESX BCn disk cache — SHA256-keyed raw pixel cache.
+ *
+ * Cache path (in order):
+ *   $VKD3D_BCN_CACHE_PATH/
+ *   $XDG_CACHE_HOME/vkd3d/bcn_cache/
+ *   ~/.cache/vkd3d/bcn_cache/
+ *
+ * Key: lowercase hex SHA256 of compressed texture bytes.
+ * Value: raw decoded pixel bytes (size determined from mip dimensions).
+ * Cache writes are async via POSIX threads.
+ */
+
+#include "esx_bcn_decode.h"
+#include "vkd3d_private.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <unistd.h>
+
+/* ── Minimal SHA256 (public domain / RFC 6234 based) ─────────────────────── */
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; int buflen; } sha256_ctx;
+
+static void sha256_init(sha256_ctx *c) {
+    c->h[0]=0x6a09e667u; c->h[1]=0xbb67ae85u; c->h[2]=0x3c6ef372u; c->h[3]=0xa54ff53au;
+    c->h[4]=0x510e527fu; c->h[5]=0x9b05688cu; c->h[6]=0x1f83d9abu; c->h[7]=0x5be0cd19u;
+    c->len=0; c->buflen=0;
+}
+static uint32_t rotr32(uint32_t x,int n){return(x>>n)|(x<<(32-n));}
+static void sha256_process_block(sha256_ctx *c, const uint8_t *blk) {
+    static const uint32_t K[64]={
+        0x428a2f98u,0x71374491u,0xb5c0fbefu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u};
+    uint32_t w[64],a,b,d,e,f,g,h,s0,s1,t1,t2;
+    for(int i=0;i<16;i++) w[i]=((uint32_t)blk[i*4]<<24)|((uint32_t)blk[i*4+1]<<16)|((uint32_t)blk[i*4+2]<<8)|blk[i*4+3];
+    for(int i=16;i<64;i++){s0=rotr32(w[i-15],7)^rotr32(w[i-15],18)^(w[i-15]>>3);s1=rotr32(w[i-2],17)^rotr32(w[i-2],19)^(w[i-2]>>10);w[i]=w[i-16]+s0+w[i-7]+s1;}
+    a=c->h[0];b=c->h[1];uint32_t cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+    for(int i=0;i<64;i++){s1=rotr32(e,6)^rotr32(e,11)^rotr32(e,25);t1=h+s1+((e&f)^(~e&g))+K[i]+w[i];s0=rotr32(a,2)^rotr32(a,13)^rotr32(a,22);t2=s0+((a&b)^(a&cc)^(b&cc));h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;}
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void sha256_update(sha256_ctx *c, const void *data, size_t len) {
+    const uint8_t *p=data; c->len+=len;
+    while(len>0){int n=(int)len<64-c->buflen?(int)len:64-c->buflen;memcpy(c->buf+c->buflen,p,n);c->buflen+=n;p+=n;len-=n;if(c->buflen==64){sha256_process_block(c,c->buf);c->buflen=0;}}
+}
+static void sha256_final(sha256_ctx *c, uint8_t out[32]) {
+    uint8_t pad[64]={0};pad[0]=0x80;int used=c->buflen;uint64_t bits=c->len*8;
+    int pad_len=(used<56)?56-used:120-used;sha256_update(c,pad,pad_len);
+    uint8_t len_bytes[8];for(int i=7;i>=0;i--){len_bytes[i]=(uint8_t)bits;bits>>=8;}sha256_update(c,len_bytes,8);
+    for(int i=0;i<8;i++){out[i*4]=(uint8_t)(c->h[i]>>24);out[i*4+1]=(uint8_t)(c->h[i]>>16);out[i*4+2]=(uint8_t)(c->h[i]>>8);out[i*4+3]=(uint8_t)c->h[i];}
+}
+
+static void compute_sha256_hex(const void *data, size_t len, char hex[65]) {
+    sha256_ctx ctx; sha256_init(&ctx); sha256_update(&ctx,data,len);
+    uint8_t digest[32]; sha256_final(&ctx,digest);
+    for(int i=0;i<32;i++) snprintf(hex+i*2,3,"%02x",digest[i]);
+    hex[64]='\0';
+}
+
+static void get_cache_dir(char *buf, size_t bufsz) {
+    const char *env=getenv("VKD3D_BCN_CACHE_PATH");
+    if(env&&env[0]){snprintf(buf,bufsz,"%s",env);return;}
+    env=getenv("XDG_CACHE_HOME");
+    if(env&&env[0]){snprintf(buf,bufsz,"%s/vkd3d/bcn_cache",env);return;}
+    const char *home=getenv("HOME");
+    snprintf(buf,bufsz,"%s/.cache/vkd3d/bcn_cache",home?home:"/tmp");
+}
+
+static void mkdir_p(const char *path) {
+    char tmp[512]; snprintf(tmp,sizeof(tmp),"%s",path);
+    for(char *p=tmp+1;*p;p++){if(*p=='/'){*p='\0';mkdir(tmp,0755);*p='/';}}
+    mkdir(tmp,0755);
+}
+
+bool esx_bcn_cache_lookup(const void *compressed, size_t compressed_size,
+                           void **out_data, size_t *out_size) {
+    char hex[65]; compute_sha256_hex(compressed,compressed_size,hex);
+    char dir[512]; get_cache_dir(dir,sizeof(dir));
+    char path[640]; snprintf(path,sizeof(path),"%s/%s",dir,hex);
+    FILE *f=fopen(path,"rb"); if(!f)return false;
+    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
+    if(sz<=0){fclose(f);return false;}
+    void *buf=malloc((size_t)sz); if(!buf){fclose(f);return false;}
+    if(fread(buf,1,(size_t)sz,f)!=(size_t)sz){free(buf);fclose(f);return false;}
+    fclose(f);
+    *out_data=buf; *out_size=(size_t)sz;
+    INFO("ESX BCn cache HIT: %s (%zu bytes)\n",hex,(size_t)sz);
+    return true;
+}
+
+typedef struct { void *comp; size_t comp_sz; void *dec; size_t dec_sz; } cache_write_args;
+static void *cache_write_thread(void *arg) {
+    cache_write_args *a=arg;
+    char hex[65]; compute_sha256_hex(a->comp,a->comp_sz,hex);
+    char dir[512]; get_cache_dir(dir,sizeof(dir));
+    mkdir_p(dir);
+    char tmp[640],final[640];
+    snprintf(tmp,sizeof(tmp),"%s/%s.tmp",dir,hex);
+    snprintf(final,sizeof(final),"%s/%s",dir,hex);
+    FILE *f=fopen(tmp,"wb");
+    if(f){fwrite(a->dec,1,a->dec_sz,f);fclose(f);rename(tmp,final);
+          INFO("ESX BCn cache WRITE: %s (%zu bytes)\n",hex,a->dec_sz);}
+    free(a->comp); free(a->dec); free(a); return NULL;
+}
+
+void esx_bcn_cache_store_async(const void *compressed, size_t compressed_size,
+                                const void *decoded, size_t decoded_size) {
+    cache_write_args *a=malloc(sizeof(*a)); if(!a)return;
+    a->comp=malloc(compressed_size); a->dec=malloc(decoded_size);
+    if(!a->comp||!a->dec){free(a->comp);free(a->dec);free(a);return;}
+    memcpy(a->comp,compressed,compressed_size);
+    memcpy(a->dec,decoded,decoded_size);
+    a->comp_sz=compressed_size; a->dec_sz=decoded_size;
+    pthread_t t; pthread_attr_t attr;
+    pthread_attr_init(&attr); pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
+    pthread_create(&t,&attr,cache_write_thread,a);
+    pthread_attr_destroy(&attr);
+}
+
+bool esx_bcn_needs_decode(const struct d3d12_device *device, DXGI_FORMAT fmt) {
+    if(device->device_info.properties2.properties.vendorID != 0x144d) return false;
+    switch(fmt){
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+    case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return true;
+    default: return false;
+    }
+}
+
+VkFormat esx_bcn_target_vkformat(DXGI_FORMAT fmt) {
+    switch(fmt){
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: return VK_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_BC4_SNORM: return VK_FORMAT_R8_SNORM;
+    case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: return VK_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_BC5_SNORM: return VK_FORMAT_R8G8_SNORM;
+    case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+        return getenv("VKD3D_BCN_BC6H_RGBA16F") ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_BC7_UNORM_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+CACHE_EOF
+
+      # ── Step 4: Compile SPIR-V shaders ───────────────────────────────────
+      - name: Compile SPIR-V
+        run: |
+          for s in shaders/esx_bc4_decode.comp shaders/esx_bc5_decode.comp \
+                   shaders/esx_bc7_decode.comp shaders/esx_bc6h_decode.comp; do
+            glslangValidator -V "$s" -o "${s%.comp}.spv"
+            echo "Compiled: $s → ${s%.comp}.spv ($(wc -c < ${s%.comp}.spv) bytes)"
+          done
+
+      # ── Step 5: Apply patch + inject sources ──────────────────────────────
+      - name: Apply patch and inject sources
+        run: |
           cd vkd3d-proton
-          git apply --check ../"$PATCH_FILE"
-          git apply ../"$PATCH_FILE"
+
+          # Apply patch (format table + swapchain + RT + resource.c)
+          git apply --check ../esx_v4.patch
+          git apply --whitespace=fix ../esx_v4.patch
+
+          # Inject new source files
+          cp ../esx_bcn_decode.h  libs/vkd3d/esx_bcn_decode.h
+          cp ../esx_bcn_cache.c   libs/vkd3d/esx_bcn_cache.c
+
+          # Create SPIR-V header directory and embed SPIR-V as C arrays
+          mkdir -p libs/vkd3d/generated
+          for shader in bc4_decode bc5_decode bc7_decode bc6h_decode; do
+            spv="../shaders/esx_${shader}.spv"
+            out="libs/vkd3d/generated/esx_${shader}_spv.h"
+            echo "/* Auto-generated SPIR-V for esx_${shader} */" > "$out"
+            echo "static const uint32_t esx_${shader}_spv[] = {" >> "$out"
+            python3 -c "
+import struct, sys
+data = open('$spv','rb').read()
+# pad to 4-byte boundary
+while len(data)%4: data+=b'\x00'
+words = struct.unpack('<'+'I'*(len(data)//4), data)
+print(','.join(hex(w) for w in words))
+" >> "$out"
+            echo "};" >> "$out"
+            echo "static const uint32_t esx_${shader}_spv_size = sizeof(esx_${shader}_spv);" >> "$out"
+            echo "Embedded SPIR-V: $shader ($(wc -l < $out) lines)"
+          done
+
+          # Register new .c files in meson.build
+          for f in esx_bcn_cache.c; do
+            if ! grep -q "$f" libs/vkd3d/meson.build; then
+              sed -i "/'utils.c',/a\\    '$f'," libs/vkd3d/meson.build
+              echo "Registered $f in meson.build"
+            fi
+          done
+
+          # Add generated/ include path to meson.build
+          if ! grep -q "generated" libs/vkd3d/meson.build; then
+            sed -i "/'libs\/vkd3d'/a\\    'libs/vkd3d/generated'," libs/vkd3d/meson.build || true
+          fi
+
           git diff --stat
 
-      - name: Build (mingw, x64 + x86)
+      # ── Step 6: Build ─────────────────────────────────────────────────────
+      - name: Build (x64 + x86)
         run: |
           cd vkd3d-proton
           ./package-release.sh esx ../out --no-package
-          ls -R ../out | head -40
 
-      - name: Package WCP
+      # ── Step 7: Write profile.json ────────────────────────────────────────
+      - name: Write profile.json
         run: |
-          XV="${{ inputs.xvkd3d_version || '0.5' }}"
-          test -f "wcp-profile.version" && XV="$(cat wcp-profile.version)"
-          ls -R out | head -40
-          mkdir -p wcp/system32 wcp/syswow64
-          cp out/vkd3d-proton-esx/x64/d3d12.dll out/vkd3d-proton-esx/x64/d3d12core.dll wcp/system32/
-          cp out/vkd3d-proton-esx/x86/d3d12.dll out/vkd3d-proton-esx/x86/d3d12core.dll wcp/syswow64/
-          sed "s/__XVKD3D_VERSION__/$XV/g" wcp-profile.json > wcp/profile.json
-          cat wcp/profile.json
-          tar -C wcp -cJf "XVKD3D-$XV-3.0.1.wcp" .
-          sha256sum "XVKD3D-$XV-3.0.1.wcp" wcp/system32/* wcp/syswow64/* | tee sha256.txt
+          cat > profile.json << 'PROFILE_EOF'
+{
+  "type": "VKD3D",
+  "name": "XVKD3D",
+  "versionName": "XVKD3D V4",
+  "versionCode": 400,
+  "description": "XVKD3D V4 — VKD3D-Proton 3.0.1. Xclipse 940 fixes: GPU compute BCn decode (BC4→R8, BC5→RG8, BC7→RGBA8, BC6H→RGB9E5/RGBA16F), disk cache, ESX RT library fix, CMA swapchain device wait.",
+  "files": [
+    { "source": "system32/d3d12.dll",     "target": "${system32}/d3d12.dll" },
+    { "source": "system32/d3d12core.dll", "target": "${system32}/d3d12core.dll" },
+    { "source": "syswow64/d3d12.dll",     "target": "${syswow64}/d3d12.dll" },
+    { "source": "syswow64/d3d12core.dll", "target": "${syswow64}/d3d12core.dll" }
+  ]
+}
+PROFILE_EOF
 
-      - name: Upload
+      # ── Step 8: Package WCP ───────────────────────────────────────────────
+      - name: Package as WCP
+        run: |
+          ls -R out/ | head -30
+          mkdir -p wcp/system32 wcp/syswow64
+          cp out/vkd3d-proton-esx/x64/d3d12.dll     wcp/system32/
+          cp out/vkd3d-proton-esx/x64/d3d12core.dll wcp/system32/
+          cp out/vkd3d-proton-esx/x86/d3d12.dll     wcp/syswow64/
+          cp out/vkd3d-proton-esx/x86/d3d12core.dll wcp/syswow64/
+          cp profile.json wcp/
+          tar -C wcp -cJf XVKD3D-V4-3.0.1.wcp .
+          sha256sum XVKD3D-V4-3.0.1.wcp wcp/system32/* wcp/syswow64/* | tee sha256.txt
+          echo "--- WCP size ---"
+          du -h XVKD3D-V4-3.0.1.wcp
+
+      # ── Step 9: Upload ────────────────────────────────────────────────────
+      - name: Upload XVKD3D V4 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: XVKD3D-${{ inputs.xvkd3d_version || '0.5' }}
+          name: XVKD3D-V4
           path: |
-            XVKD3D-*.wcp
+            XVKD3D-V4-3.0.1.wcp
             sha256.txt
+
+  # ── Second job: Umbra-VK V4 (same patches, different profile name) ────────
+  build-umbra:
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    needs: build
+    steps:
+      - name: Download XVKD3D V4 WCP
+        uses: actions/download-artifact@v4
+        with:
+          name: XVKD3D-V4
+
+      - name: Repackage as Umbra-VK V4
+        run: |
+          # Umbra-VK is the same DLLs, different profile metadata
+          mkdir -p xvkd3d_extracted
+          tar -xJf XVKD3D-V4-3.0.1.wcp -C xvkd3d_extracted
+
+          # Replace profile.json with Umbra-VK identity
+          cat > xvkd3d_extracted/profile.json << 'UMBRA_PROFILE_EOF'
+{
+  "type": "VKD3D",
+  "name": "Umbra-VK",
+  "versionName": "Umbra-VK V4",
+  "versionCode": 400,
+  "description": "Umbra-VK V4 — VKD3D-Proton 3.0.1. Xclipse 940 silicon BCn fix via GPU compute decode + persistent disk cache. BC4→R8, BC5→RG8, BC7→RGBA8, BC6H→RGB9E5 (default) / RGBA16F (VKD3D_BCN_BC6H_RGBA16F=1). ESX RT fix. CMA swapchain device wait.",
+  "files": [
+    { "source": "system32/d3d12.dll",     "target": "${system32}/d3d12.dll" },
+    { "source": "system32/d3d12core.dll", "target": "${system32}/d3d12core.dll" },
+    { "source": "syswow64/d3d12.dll",     "target": "${syswow64}/d3d12.dll" },
+    { "source": "syswow64/d3d12core.dll", "target": "${syswow64}/d3d12core.dll" }
+  ]
+}
+UMBRA_PROFILE_EOF
+
+          tar -C xvkd3d_extracted -cJf Umbra-VK-V4-3.0.1.wcp .
+          sha256sum Umbra-VK-V4-3.0.1.wcp | tee umbra_sha256.txt
+          du -h Umbra-VK-V4-3.0.1.wcp
+
+      - name: Upload Umbra-VK V4 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Umbra-VK-V4
+          path: |
+            Umbra-VK-V4-3.0.1.wcp
+            umbra_sha256.txt
