@@ -68,6 +68,19 @@ jobs:
           index 353a5d69..3fa99140 100644
           --- a/libs/vkd3d/raytracing_pipeline.c
           +++ b/libs/vkd3d/raytracing_pipeline.c
+          @@ -2620,5 +2620,12 @@
+                   }
+               }
+           }
+
+          +
+          +static bool vkd3d_esx_no_rt_libraries(const struct d3d12_device *device)
+          +{
+          +    return (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ESX_NO_RT_LIBRARIES) ||
+          +            device->device_info.properties2.properties.vendorID == 0x144d;
+          +}
+          +
+           static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
           @@ -2661,6 +2661,23 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
                if (FAILED(hr = d3d12_state_object_pipeline_data_find_global_state_objects(&data,
                        &object->shader_config, &object->pipeline_config)))
